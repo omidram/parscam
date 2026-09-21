@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "model": "yolo26n.pt",
+  "open_vocab_model": "yoloe-26n-seg.pt",
+  "use_open_vocab": false,
+  "confidence": 0.35,
+  "ov_confidence": 0.22,
+  "infer_every_n_frames": 5,
+  "ov_every_n_frames": 12,
+  "imgsz": 320,
+  "ov_imgsz": 480,
+  "max_det": 20,
+  "infer_max_width": 640,
+  "cooldown_sec": 20,
+  "filters": {
+    "human": true,
+    "fire": false,
+    "gun": false,
+    "knife": false,
+    "animal": true,
+    "vehicle": true
+  },
+  "notify": true,
+  "auto_record_on_detect": true,
+  "record_duration_sec": 60,
+  "auto_screenshot_on_detect": true,
+  "draw_boxes": true,
+  "live_overlay": true
+}
