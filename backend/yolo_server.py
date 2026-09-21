@@ -3,9 +3,17 @@
 سرور HTTP تشخیص YOLO26 برای پارس کم — پورت ۹۰۱۰
 """
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+# Windows consoles (cp1252) crash on Persian prints — force UTF-8 I/O early.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from yolo_engine import engine
 
@@ -76,11 +84,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print("پارس کم · YOLO26 Detection Server")
+    print("Pars Cam | YOLO26 Detection Server")
     print(f"http://{HOST}:{PORT}/api/yolo/status")
     print("=" * 60)
-    engine.start()
+    # Bind HTTP first so /status comes online even while the model loads.
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    threading.Thread(target=engine.start, daemon=True, name="yolo-engine-start").start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

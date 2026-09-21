@@ -145,7 +145,15 @@ export function YoloSettingsPanel() {
             setMsg("موتور YOLO از داخل پارس کم راه‌اندازی شد.");
             break;
           }
-          if (i === 39) setMsg("راه‌اندازی طولانی شد؛ وضعیت را دوباره بررسی کنید.");
+          if (body.last_error) {
+            setMsg(String(body.last_error));
+            break;
+          }
+          if (i === 39) {
+            setMsg(
+              "راه‌اندازی طولانی شد. اگر سرور آفلاین ماند، next dev را یک‌بار ری‌استارت کنید.",
+            );
+          }
         }
       } else if (action === "start") {
         setMsg(
@@ -224,7 +232,13 @@ export function YoloSettingsPanel() {
           </div>
           <div className="rounded-2xl bg-[var(--surface-soft)] px-3 py-2 text-[0.8rem]">
             مدل:{" "}
-            <b>{status?.model_loaded ? "YOLO26n" : "—"}</b>
+            <b>
+              {status?.model_loaded
+                ? status?.open_vocab_loaded
+                  ? "YOLO26n + YOLOE"
+                  : "YOLO26n"
+                : "—"}
+            </b>
           </div>
           <div className="rounded-2xl bg-[var(--surface-soft)] px-3 py-2 text-[0.8rem]">
             تشخیص‌ها:{" "}
@@ -245,11 +259,19 @@ export function YoloSettingsPanel() {
             <button
               key={key}
               type="button"
-              onClick={() =>
-                save({
-                  filters: { [key]: !settings.filters[key] },
-                })
-              }
+              onClick={() => {
+                const next = !settings.filters[key];
+                const patch: Partial<YoloSettings> & {
+                  filters: Partial<Filters>;
+                } = {
+                  filters: { [key]: next },
+                };
+                // آتش/اسلحه/چاقو نیاز به YOLOE دارند
+                if (next && (key === "fire" || key === "gun" || key === "knife")) {
+                  patch.use_open_vocab = true;
+                }
+                save(patch);
+              }}
               className={`flex items-center gap-2 rounded-2xl border px-3 py-3 text-right transition ${
                 settings.filters[key]
                   ? "border-[var(--primary)] bg-[var(--primary-soft)] text-[var(--primary)]"
@@ -310,7 +332,7 @@ export function YoloSettingsPanel() {
             [
               ["enabled", "فعال بودن موتور YOLO26n"],
               ["live_overlay", "کادر سبز زنده دور سوژه در استریم"],
-              ["use_open_vocab", "YOLOE سنگین (آتش/اسلحه/چاقو) — کندتر"],
+              ["use_open_vocab", "تشخیص آتش / اسلحه / چاقو (YOLOE)"],
               ["notify", "هشدار و نوتیفیکیشن هنگام تشخیص"],
               [
                 "auto_record_on_detect",
