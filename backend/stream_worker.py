@@ -18,6 +18,16 @@ JPEG_QUALITY = 68
 BASE_DIR = Path(__file__).resolve().parent
 OVERLAY_FILE = BASE_DIR / "yolo_overlays.json"
 
+# OpenCV putText cannot render Persian — always use ASCII labels on the live box.
+FILTER_LABELS_EN = {
+    "human": "Person",
+    "fire": "Fire",
+    "gun": "Gun",
+    "knife": "Knife",
+    "animal": "Animal",
+    "vehicle": "Vehicle",
+}
+
 
 def load_overlay(cam_id: str | None):
     if not cam_id or not OVERLAY_FILE.exists():
@@ -33,6 +43,17 @@ def load_overlay(cam_id: str | None):
         return entry
     except Exception:
         return None
+
+
+def overlay_tag(hit: dict) -> str:
+    filt = str(hit.get("filter") or "")
+    label = FILTER_LABELS_EN.get(filt) or str(hit.get("label") or "Object")
+    # Strip non-ASCII so ????? never appears on the frame
+    label = label.encode("ascii", "ignore").decode("ascii").strip() or "Object"
+    conf = hit.get("confidence")
+    if isinstance(conf, (int, float)):
+        return f"{label} {conf:.0%}"
+    return label
 
 
 def draw_overlay(frame, entry):
@@ -53,11 +74,7 @@ def draw_overlay(frame, entry):
         x2 = int(x2 * sx)
         y2 = int(y2 * sy)
         cv2.rectangle(frame, (x1, y1), (x2, y2), green, 2)
-        label = str(h.get("label_fa") or h.get("label") or "")
-        conf = h.get("confidence")
-        tag = label
-        if isinstance(conf, (int, float)):
-            tag = f"{label} {conf:.0%}".strip()
+        tag = overlay_tag(h)
         if tag:
             cv2.putText(
                 frame,
@@ -93,9 +110,21 @@ def main() -> int:
     cap = None
     backoff = 0.5
     empty_reads = 0
-    overlay_check_every = 2
+    overlay_check_every = 3
     frame_i = 0
     cached_overlay = None
+    last_jpeg: bytes | None = None
+    last_emit = 0.0
+
+    def emit_jpeg(jpeg: bytes) -> None:
+        nonlocal last_jpeg, last_emit
+        last_jpeg = jpeg
+        last_emit = time.time()
+        chunk = (
+            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+        )
+        out.write(chunk)
+        out.flush()
 
     try:
         while True:
@@ -108,24 +137,40 @@ def main() -> int:
                             pass
                     cap = cv2.VideoCapture(rtsp, cv2.CAP_FFMPEG)
                     if not cap.isOpened():
+                        # Keep MJPEG alive so the browser <img> does not error out.
+                        if last_jpeg is not None and time.time() - last_emit > 0.4:
+                            try:
+                                emit_jpeg(last_jpeg)
+                            except BrokenPipeError:
+                                break
                         time.sleep(backoff)
-                        backoff = min(backoff * 1.8, 6.0)
+                        backoff = min(backoff * 1.8, 4.0)
                         continue
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
                     backoff = 0.5
                     empty_reads = 0
 
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     empty_reads += 1
-                    if empty_reads > 30:
+                    # Hold last frame so the HTTP multipart stream never stalls.
+                    if last_jpeg is not None and time.time() - last_emit > 0.35:
+                        try:
+                            emit_jpeg(last_jpeg)
+                        except BrokenPipeError:
+                            break
+                    if empty_reads > 80:
                         try:
                             cap.release()
                         except Exception:
                             pass
                         cap = None
                         empty_reads = 0
-                    time.sleep(0.05)
+                    else:
+                        time.sleep(0.03)
                     continue
 
                 empty_reads = 0
@@ -134,10 +179,14 @@ def main() -> int:
                 if w != FRAME_WIDTH or h != FRAME_HEIGHT:
                     frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-                if frame_i % overlay_check_every == 0:
-                    cached_overlay = load_overlay(cam_id)
-                if cached_overlay:
-                    frame = draw_overlay(frame, cached_overlay)
+                # Overlay must never tear down the RTSP session.
+                try:
+                    if frame_i % overlay_check_every == 0:
+                        cached_overlay = load_overlay(cam_id)
+                    if cached_overlay:
+                        frame = draw_overlay(frame, cached_overlay)
+                except Exception:
+                    cached_overlay = None
 
                 ok, buf = cv2.imencode(
                     ".jpg",
@@ -147,25 +196,28 @@ def main() -> int:
                 if not ok:
                     continue
 
-                chunk = (
-                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                    + buf.tobytes()
-                    + b"\r\n"
-                )
-                out.write(chunk)
-                out.flush()
+                emit_jpeg(buf.tobytes())
             except BrokenPipeError:
                 break
             except Exception as e:
                 sys.stderr.write(f"stream_worker: {e}\n")
-                if cap is not None:
+                # Prefer holding the pipe with last frame over full reconnect storms.
+                if last_jpeg is not None:
                     try:
-                        cap.release()
+                        emit_jpeg(last_jpeg)
+                    except BrokenPipeError:
+                        break
                     except Exception:
                         pass
-                cap = None
-                time.sleep(backoff)
-                backoff = min(backoff * 1.8, 6.0)
+                if empty_reads > 40 or cap is None:
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                    cap = None
+                time.sleep(min(backoff, 1.5))
+                backoff = min(backoff * 1.5, 4.0)
     finally:
         if cap is not None:
             try:

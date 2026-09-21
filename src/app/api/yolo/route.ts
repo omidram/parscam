@@ -25,21 +25,21 @@ const DEFAULTS = {
   enabled: true,
   model: "yolo26n.pt",
   open_vocab_model: "yoloe-26n-seg.pt",
-  use_open_vocab: false,
-  confidence: 0.35,
-  ov_confidence: 0.22,
+  use_open_vocab: true,
+  confidence: 0.32,
+  ov_confidence: 0.12,
   infer_every_n_frames: 5,
-  ov_every_n_frames: 12,
+  ov_every_n_frames: 6,
   imgsz: 320,
-  max_det: 20,
-  cooldown_sec: 20,
+  max_det: 25,
+  cooldown_sec: 15,
   filters: {
     human: true,
-    fire: false,
-    gun: false,
-    knife: false,
-    animal: true,
-    vehicle: true,
+    fire: true,
+    gun: true,
+    knife: true,
+    animal: false,
+    vehicle: false,
   },
   notify: true,
   auto_record_on_detect: true,
@@ -141,6 +141,13 @@ export async function PUT(req: NextRequest) {
   }
   for (const [k, v] of Object.entries(body)) {
     if (k !== "filters") (current as Record<string, unknown>)[k] = v;
+  }
+  if (
+    current.filters?.fire ||
+    current.filters?.gun ||
+    current.filters?.knife
+  ) {
+    current.use_open_vocab = true;
   }
   fs.writeFileSync(
     /*turbopackIgnore: true*/ settingsPath(),

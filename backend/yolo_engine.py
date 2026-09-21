@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parent
 CAMERAS_FILE = BASE_DIR / "cameras.json"
@@ -47,37 +48,28 @@ COCO_FILTER_MAP = {
     },
 }
 
-# پرامپت‌های open-vocab برای YOLOE (آتش / اسلحه / چاقو) — غنی‌تر برای دقت بهتر
+# پرامپت‌های open-vocab برای YOLOE (آتش / اسلحه / چاقو)
+# کوتاه و مشخص — با get_text_pe دقت خیلی بهتر از لیست طولانی است
 OPEN_VOCAB_FILTER_MAP = {
     "fire": [
         "fire",
         "flame",
-        "flames",
-        "blaze",
-        "burning fire",
-        "open flame",
-        "fire smoke",
-        "campfire",
-        "house fire",
+        "lighter flame",
+        "burning flame",
+        "orange fire",
     ],
     "gun": [
-        "gun",
-        "pistol",
         "handgun",
-        "rifle",
+        "pistol",
+        "gun",
         "firearm",
-        "shotgun",
-        "person holding gun",
-        "person with pistol",
-        "weapon gun",
+        "rifle",
     ],
     "knife": [
         "knife",
+        "kitchen knife",
         "blade",
         "dagger",
-        "machete",
-        "person holding knife",
-        "kitchen knife",
     ],
 }
 
@@ -90,28 +82,39 @@ FILTER_LABELS_FA = {
     "vehicle": "ماشین",
 }
 
+# ASCII labels for OpenCV putText (Persian renders as ???)
+FILTER_LABELS_EN = {
+    "human": "Person",
+    "fire": "Fire",
+    "gun": "Gun",
+    "knife": "Knife",
+    "animal": "Animal",
+    "vehicle": "Vehicle",
+}
+
 DEFAULT_YOLO_SETTINGS = {
     "enabled": True,
     "model": "yolo26n.pt",
     "open_vocab_model": "yoloe-26n-seg.pt",
-    # حالت سبک: فقط YOLO26n — YOLOE فقط اگر use_open_vocab روشن باشد
-    "use_open_vocab": False,
-    "confidence": 0.35,
-    "ov_confidence": 0.22,
+    # وقتی آتش/اسلحه/چاقو روشن باشد، YOLOE خودکار فعال می‌شود
+    "use_open_vocab": True,
+    "confidence": 0.32,
+    "ov_confidence": 0.12,
     "infer_every_n_frames": 5,
-    "ov_every_n_frames": 12,
+    "ov_every_n_frames": 6,
     "imgsz": 320,
-    "ov_imgsz": 480,
-    "max_det": 20,
+    "ov_imgsz": 640,
+    "max_det": 25,
     "infer_max_width": 640,
-    "cooldown_sec": 20,
+    "ov_infer_max_width": 960,
+    "cooldown_sec": 15,
     "filters": {
         "human": True,
-        "fire": False,
-        "gun": False,
-        "knife": False,
-        "animal": True,
-        "vehicle": True,
+        "fire": True,
+        "gun": True,
+        "knife": True,
+        "animal": False,
+        "vehicle": False,
     },
     "notify": True,
     "auto_record_on_detect": True,
@@ -197,24 +200,58 @@ class YoloEngine:
                     self.settings["filters"].update(v)
                 elif k in DEFAULT_YOLO_SETTINGS:
                     self.settings[k] = v
+            # آتش/اسلحه/چاقو بدون YOLOE کار نمی‌کنند — خودکار روشن کن
+            if any(
+                self.settings["filters"].get(k)
+                for k in ("fire", "gun", "knife")
+            ):
+                self.settings["use_open_vocab"] = True
             self.save_settings()
+            # اگر کلاس‌های OV عوض شد، در ensure_models دوباره set می‌شوند
+            self._ov_class_names = None
             return dict(self.settings)
 
     # ---------- models ----------
+    def _desired_ov_names(self) -> list[str]:
+        names: list[str] = []
+        for key, prompts in OPEN_VOCAB_FILTER_MAP.items():
+            if self.settings["filters"].get(key):
+                names.extend(prompts)
+        # ترتیب پایدار + بدون تکرار
+        return list(dict.fromkeys(names))
+
+    def _apply_ov_classes(self, names: list[str]) -> None:
+        if not names or self._ov_model is None:
+            return
+        # YOLOE بدون text prompt embeddings practically کور است
+        try:
+            pe = self._ov_model.get_text_pe(names)
+            self._ov_model.set_classes(names, pe)
+        except Exception:
+            self._ov_model.set_classes(names)
+        self._ov_class_names = list(names)
+
+    def need_open_vocab(self) -> bool:
+        return bool(self.settings.get("use_open_vocab", False)) and any(
+            self.settings["filters"].get(k) for k in ("fire", "gun", "knife")
+        )
+
     def ensure_models(self) -> None:
         if self._coco_model is None:
             from ultralytics import YOLO
 
             model_name = self.settings.get("model", "yolo26n.pt")
-            self._coco_model = YOLO(model_name)
+            path = BASE_DIR / model_name
+            self._coco_model = YOLO(str(path if path.exists() else model_name))
             self.status["model_loaded"] = True
             self.status["model_name"] = model_name
 
-        use_ov = bool(self.settings.get("use_open_vocab", False))
-        need_ov = use_ov and any(
-            self.settings["filters"].get(k) for k in ("fire", "gun", "knife")
-        )
-        if not need_ov:
+        if not self.need_open_vocab():
+            self.status["open_vocab_loaded"] = bool(self._ov_model is not None)
+            return
+
+        names = self._desired_ov_names()
+        if not names:
             self.status["open_vocab_loaded"] = False
             return
 
@@ -222,35 +259,23 @@ class YoloEngine:
             try:
                 from ultralytics import YOLO
 
-                names: list[str] = []
-                for key, prompts in OPEN_VOCAB_FILTER_MAP.items():
-                    if self.settings["filters"].get(key):
-                        # سبک‌تر: فقط ۲ پرامپت اصلی برای هر کلاس
-                        names.extend(prompts[:2])
-                names = list(dict.fromkeys(names))
-                if names:
-                    self._ov_model = YOLO(
-                        self.settings.get("open_vocab_model", "yoloe-26n-seg.pt")
-                    )
-                    self._ov_model.set_classes(names)
-                    self._ov_class_names = names
-                    self.status["open_vocab_loaded"] = True
+                ov_name = self.settings.get("open_vocab_model", "yoloe-26n-seg.pt")
+                ov_path = BASE_DIR / ov_name
+                self._ov_model = YOLO(str(ov_path if ov_path.exists() else ov_name))
+                self._apply_ov_classes(names)
+                self.status["open_vocab_loaded"] = True
+                self.status["last_error"] = ""
             except Exception as e:
                 self.status["last_error"] = f"open-vocab: {e}"
                 self.status["open_vocab_loaded"] = False
-        else:
+                self._ov_model = None
+        elif names != getattr(self, "_ov_class_names", None):
             try:
-                names = []
-                for key, prompts in OPEN_VOCAB_FILTER_MAP.items():
-                    if self.settings["filters"].get(key):
-                        names.extend(prompts[:2])
-                names = list(dict.fromkeys(names))
-                if names and names != getattr(self, "_ov_class_names", None):
-                    self._ov_model.set_classes(names)
-                    self._ov_class_names = names
+                self._apply_ov_classes(names)
+                self.status["open_vocab_loaded"] = True
             except Exception as e:
                 self.status["last_error"] = f"open-vocab refresh: {e}"
-
+                self.status["open_vocab_loaded"] = False
     def active_coco_class_ids(self) -> list[int] | None:
         ids: list[int] = []
         for filt, class_ids in COCO_CLASS_IDS.items():
@@ -337,10 +362,12 @@ class YoloEngine:
                 for k, v in data.items()
                 if isinstance(v, dict) and now - float(v.get("ts", 0)) < 10
             }
-            OVERLAY_FILE.write_text(
+            tmp = OVERLAY_FILE.with_suffix(".json.tmp")
+            tmp.write_text(
                 json.dumps(data, ensure_ascii=False),
                 encoding="utf-8",
             )
+            tmp.replace(OVERLAY_FILE)
         except Exception as e:
             self.status["last_error"] = f"overlay: {e}"
 
@@ -348,14 +375,14 @@ class YoloEngine:
         self, frame, run_coco: bool = True, run_ov: bool = True
     ) -> list[dict]:
         self.ensure_models()
-        conf = float(self.settings.get("confidence", 0.35))
-        ov_conf = float(self.settings.get("ov_confidence", 0.22))
+        conf = float(self.settings.get("confidence", 0.32))
+        ov_conf = float(self.settings.get("ov_confidence", 0.12))
         imgsz = int(self.settings.get("imgsz", 320))
-        ov_imgsz = int(self.settings.get("ov_imgsz", 480))
-        max_det = int(self.settings.get("max_det", 20))
+        ov_imgsz = int(self.settings.get("ov_imgsz", 640))
+        max_det = int(self.settings.get("max_det", 25))
         hits: list[dict] = []
 
-        # کوچک‌کردن فریم برای اینفرنس سریع‌تر
+        # کوچک‌کردن فریم برای اینفرنس سریع‌تر (COCO)
         max_w = int(self.settings.get("infer_max_width", 640))
         h0, w0 = frame.shape[:2]
         scale = 1.0
@@ -374,7 +401,6 @@ class YoloEngine:
             )
             if class_ids is not None:
                 kwargs["classes"] = class_ids
-            # FP16 اگر GPU باشد
             try:
                 kwargs["half"] = True
                 results = self._coco_model.predict(infer, **kwargs)
@@ -404,16 +430,21 @@ class YoloEngine:
                         }
                     )
 
-        use_ov = bool(self.settings.get("use_open_vocab", False))
         if (
-            use_ov
-            and run_ov
+            run_ov
+            and self.need_open_vocab()
             and self._ov_model is not None
-            and any(self.settings["filters"].get(k) for k in ("fire", "gun", "knife"))
         ):
             try:
+                # وضوح بالاتر برای اشیای کوچک (چاقو / فندک / اسلحه)
+                ov_max_w = int(self.settings.get("ov_infer_max_width", 960))
+                ov_scale = 1.0
+                ov_infer = frame
+                if w0 > ov_max_w:
+                    ov_scale = ov_max_w / float(w0)
+                    ov_infer = cv2.resize(frame, (ov_max_w, int(h0 * ov_scale)))
                 results = self._ov_model.predict(
-                    infer,
+                    ov_infer,
                     conf=ov_conf,
                     imgsz=ov_imgsz,
                     max_det=max_det,
@@ -430,8 +461,15 @@ class YoloEngine:
                         if not filt:
                             continue
                         xyxy = [float(x) for x in box.xyxy[0].tolist()]
-                        if scale != 1.0:
-                            xyxy = [v / scale for v in xyxy]
+                        if ov_scale != 1.0:
+                            xyxy = [v / ov_scale for v in xyxy]
+                        # اشیای خیلی کوچک (مثل شعله فندک) را رد نکن
+                        bw = abs(xyxy[2] - xyxy[0])
+                        bh = abs(xyxy[3] - xyxy[1])
+                        if filt != "fire" and (bw < 8 or bh < 8):
+                            continue
+                        if filt == "fire" and (bw < 4 or bh < 4):
+                            continue
                         hits.append(
                             {
                                 "filter": filt,
@@ -444,8 +482,66 @@ class YoloEngine:
             except Exception as e:
                 self.status["last_error"] = f"ov predict: {e}"
 
+            # کمکی رنگ‌محور برای شعله کوچک (فندک) وقتی فیلتر آتش روشن است
+            if self.settings["filters"].get("fire"):
+                try:
+                    fire_hits = self.detect_small_flame(frame)
+                    hits.extend(fire_hits)
+                except Exception as e:
+                    self.status["last_error"] = f"flame assist: {e}"
+
         return hits
 
+    def detect_small_flame(self, frame) -> list[dict]:
+        """HSV assist for tiny lighter-like flames — complements YOLOE."""
+        h0, w0 = frame.shape[:2]
+        # کار روی نسخه کوچک برای سرعت
+        scale = 1.0
+        small = frame
+        if w0 > 640:
+            scale = 640 / float(w0)
+            small = cv2.resize(frame, (640, int(h0 * scale)))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        # نارنجی/زرد روشن شعله
+        mask1 = cv2.inRange(hsv, (0, 120, 160), (25, 255, 255))
+        mask2 = cv2.inRange(hsv, (160, 80, 160), (180, 255, 255))
+        mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out: list[dict] = []
+        area_img = small.shape[0] * small.shape[1]
+        for c in cnts:
+            area = cv2.contourArea(c)
+            # شعله فندک کوچک است؛ آتش بزرگ هم قبول
+            if area < 18 or area > area_img * 0.25:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            aspect = h / max(w, 1)
+            # شعله معمولاً عمودی‌تر از لکه نارنجی تصادفی است
+            if aspect < 0.6 and area < 120:
+                continue
+            # روشنایی داخل باکس
+            roi = small[y : y + h, x : x + w]
+            if roi.size == 0:
+                continue
+            mean_v = float(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 2].mean())
+            if mean_v < 150:
+                continue
+            xyxy = [float(x), float(y), float(x + w), float(y + h)]
+            if scale != 1.0:
+                xyxy = [v / scale for v in xyxy]
+            conf = min(0.55, 0.18 + area / 800.0)
+            out.append(
+                {
+                    "filter": "fire",
+                    "label": "lighter flame",
+                    "label_fa": FILTER_LABELS_FA["fire"],
+                    "confidence": conf,
+                    "bbox": xyxy,
+                }
+            )
+        return out[:3]
     def draw_hits(self, frame, hits: list[dict]):
         # live overlay uses green; screenshots keep colored boxes
         colors = {
@@ -460,7 +556,9 @@ class YoloEngine:
             x1, y1, x2, y2 = map(int, h["bbox"])
             c = colors.get(h["filter"], (0, 220, 0))
             cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
-            tag = f'{h["label_fa"]} {h["confidence"]:.0%}'
+            en = FILTER_LABELS_EN.get(h["filter"]) or str(h.get("label") or "Object")
+            en = en.encode("ascii", "ignore").decode("ascii").strip() or "Object"
+            tag = f'{en} {h["confidence"]:.0%}'
             cv2.putText(
                 frame, tag, (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2, cv2.LINE_AA,
@@ -631,8 +729,14 @@ class YoloEngine:
                 time.sleep(1)
                 continue
             every = max(2, int(self.settings.get("infer_every_n_frames", 5)))
-            use_ov = bool(self.settings.get("use_open_vocab", False))
-            ov_every = max(every * 2, int(self.settings.get("ov_every_n_frames", 12)))
+            use_ov = self.need_open_vocab()
+            ov_every = max(3, int(self.settings.get("ov_every_n_frames", 6)))
+            # اگر OV لازم است ولی مدل هنوز لود نشده، یک‌بار تلاش کن
+            if use_ov and self._ov_model is None:
+                try:
+                    self.ensure_models()
+                except Exception as e:
+                    self.status["last_error"] = str(e)
             cap = cv2.VideoCapture(rtsp, cv2.CAP_FFMPEG)
             if not cap.isOpened() and rtsp != primary:
                 rtsp = primary

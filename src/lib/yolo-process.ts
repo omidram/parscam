@@ -33,6 +33,8 @@ async function waitUntilOnline(ms = 45000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < ms) {
     if (await isYoloOnline()) return true;
+    // Spawn failed / crashed — stop waiting so the UI is not stuck on loading.
+    if (yoloProc && yoloProc.exitCode !== null) return false;
     await new Promise((r) => setTimeout(r, 800));
   }
   return false;
@@ -40,6 +42,15 @@ async function waitUntilOnline(ms = 45000): Promise<boolean> {
 
 function logPath() {
   return path.join(/*turbopackIgnore: true*/ projectRoot(), "yolo_server.log");
+}
+
+function readRecentLogTail(maxChars = 1200): string {
+  try {
+    const raw = fs.readFileSync(logPath(), "utf-8");
+    return raw.slice(-maxChars).trim();
+  } catch {
+    return "";
+  }
 }
 
 function spawnYoloOnce(): { ok: boolean; error?: string } {
@@ -56,6 +67,8 @@ function spawnYoloOnce(): { ok: boolean; error?: string } {
   const env = {
     ...process.env,
     PYTHONUNBUFFERED: "1",
+    PYTHONIOENCODING: "utf-8",
+    PYTHONUTF8: "1",
     OPENCV_FFMPEG_CAPTURE_OPTIONS:
       "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
   };
@@ -141,14 +154,26 @@ export async function startYoloProcess(): Promise<{
 
   starting = (async () => {
     try {
+      // Give the child a moment to crash on import/encoding errors.
+      await new Promise((r) => setTimeout(r, 1500));
+      if (yoloProc && yoloProc.exitCode !== null) {
+        const tail = readRecentLogTail();
+        return {
+          ok: false,
+          error:
+            "موتور YOLO بلافاصله متوقف شد." +
+            (tail ? `\n${tail.slice(-400)}` : " لاگ yolo_server.log را ببینید."),
+        };
+      }
       const up = await waitUntilOnline(180000);
-      return up
-        ? { ok: true }
-        : {
-            ok: false,
-            error:
-              "راه‌اندازی YOLO طولانی شد. لاگ yolo_server.log را در پوشه پروژه ببینید.",
-          };
+      if (up) return { ok: true };
+      const tail = readRecentLogTail();
+      return {
+        ok: false,
+        error:
+          "راه‌اندازی YOLO طولانی شد." +
+          (tail ? `\n${tail.slice(-400)}` : " لاگ yolo_server.log را ببینید."),
+      };
     } finally {
       starting = null;
     }
