@@ -35,6 +35,8 @@ type YoloSettings = {
   record_duration_sec: number;
   auto_screenshot_on_detect: boolean;
   draw_boxes: boolean;
+  use_open_vocab?: boolean;
+  live_overlay?: boolean;
 };
 
 type Status = {
@@ -181,10 +183,10 @@ export function YoloSettingsPanel() {
             </div>
             <div>
               <h2 className="text-[1.05rem] font-extrabold text-[var(--primary-deep)]">
-                YOLO26 · تشخیص هوشمند
+                YOLO26n · حالت سبک
               </h2>
               <p className="text-[0.8rem] text-[var(--muted)]">
-                انسان، آتش، اسلحه، چاقو، حیوانات و ماشین
+                مدل nano با کادر سبز زنده دور سوژه — بهینه برای اجرای روان
               </p>
             </div>
           </div>
@@ -221,8 +223,8 @@ export function YoloSettingsPanel() {
             </b>
           </div>
           <div className="rounded-2xl bg-[var(--surface-soft)] px-3 py-2 text-[0.8rem]">
-            مدل YOLO26:{" "}
-            <b>{status?.model_loaded ? "بارگذاری شده" : "—"}</b>
+            مدل:{" "}
+            <b>{status?.model_loaded ? "YOLO26n" : "—"}</b>
           </div>
           <div className="rounded-2xl bg-[var(--surface-soft)] px-3 py-2 text-[0.8rem]">
             تشخیص‌ها:{" "}
@@ -306,7 +308,9 @@ export function YoloSettingsPanel() {
         <div className="mt-4 grid gap-2">
           {(
             [
-              ["enabled", "فعال بودن موتور YOLO"],
+              ["enabled", "فعال بودن موتور YOLO26n"],
+              ["live_overlay", "کادر سبز زنده دور سوژه در استریم"],
+              ["use_open_vocab", "YOLOE سنگین (آتش/اسلحه/چاقو) — کندتر"],
               ["notify", "هشدار و نوتیفیکیشن هنگام تشخیص"],
               [
                 "auto_record_on_detect",
@@ -322,18 +326,24 @@ export function YoloSettingsPanel() {
             <button
               key={key}
               type="button"
-              onClick={() => save({ [key]: !settings[key] })}
+              onClick={() =>
+                save({ [key]: !(settings as Record<string, unknown>)[key] })
+              }
               className="flex w-full items-center justify-between rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] px-3.5 py-3 text-right"
             >
               <span className="text-[0.88rem] font-semibold">{label}</span>
               <span
                 className={`relative h-6 w-11 rounded-full transition ${
-                  settings[key] ? "bg-[var(--primary)]" : "bg-[var(--line)]"
+                  (settings as Record<string, unknown>)[key]
+                    ? "bg-[var(--primary)]"
+                    : "bg-[var(--line)]"
                 }`}
               >
                 <span
                   className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${
-                    settings[key] ? "start-5" : "start-0.5"
+                    (settings as Record<string, unknown>)[key]
+                      ? "start-5"
+                      : "start-0.5"
                   }`}
                 />
               </span>

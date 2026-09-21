@@ -48,9 +48,11 @@ export default function RecordingsPage() {
     });
   }, [items, camFilter, query]);
 
-  function fileUrl(r: Rec, download = false) {
+  function fileUrl(r: Rec, download = false, play = false) {
     const u = `/api/recordings/file?cam=${encodeURIComponent(r.cam)}&file=${encodeURIComponent(r.filename)}`;
-    return download ? `${u}&download=1` : u;
+    if (download) return `${u}&download=1`;
+    if (play) return `${u}&play=1`;
+    return u;
   }
 
   return (
@@ -153,9 +155,13 @@ export default function RecordingsPage() {
               key={playing.id}
               controls
               autoPlay
+              playsInline
+              preload="auto"
               className="aspect-video w-full bg-black"
-              src={fileUrl(playing)}
-            />
+              src={fileUrl(playing, false, true)}
+            >
+              مرورگر شما پخش ویدیو را پشتیبانی نمی‌کند.
+            </video>
           </div>
         </div>
       ) : null}

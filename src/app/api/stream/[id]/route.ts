@@ -80,7 +80,7 @@ export async function GET(req: NextRequest, ctx: Ctx) {
       const proc = spawnMjpegStream(rtsp);
       return attachStream(proc, req, "ffmpeg");
     }
-    const proc = spawnOpenCvMjpeg(rtsp);
+    const proc = spawnOpenCvMjpeg(rtsp, id);
     // if python spawn fails immediately, fall back
     const failed = await new Promise<boolean>((resolve) => {
       const t = setTimeout(() => resolve(false), 500);

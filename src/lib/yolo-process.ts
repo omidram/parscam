@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "child_process";
+import fs from "fs";
 import path from "path";
 import { projectRoot } from "@/lib/server-paths";
 
@@ -11,7 +12,7 @@ let starting: Promise<{ ok: boolean; error?: string }> | null = null;
 export async function isYoloOnline(): Promise<boolean> {
   try {
     const res = await fetch(`${YOLO_BASE}/api/yolo/status`, {
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(2000),
     });
     return res.ok;
   } catch {
@@ -22,7 +23,7 @@ export async function isYoloOnline(): Promise<boolean> {
 export async function yoloFetch(pathname: string, init?: RequestInit) {
   const res = await fetch(`${YOLO_BASE}${pathname}`, {
     ...init,
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`yolo ${res.status}`);
   return res.json();
@@ -37,26 +38,45 @@ async function waitUntilOnline(ms = 45000): Promise<boolean> {
   return false;
 }
 
+function logPath() {
+  return path.join(/*turbopackIgnore: true*/ projectRoot(), "yolo_server.log");
+}
+
 function spawnYoloOnce(): { ok: boolean; error?: string } {
-  if (yoloProc && !yoloProc.killed) return { ok: true };
+  if (yoloProc && !yoloProc.killed && yoloProc.exitCode === null) {
+    return { ok: true };
+  }
 
   const root = /*turbopackIgnore: true*/ projectRoot();
   const script = path.join(/*turbopackIgnore: true*/ root, "yolo_server.py");
-  const env = { ...process.env, PYTHONUNBUFFERED: "1" };
-  const spawnOpts = {
-    cwd: root,
-    windowsHide: true,
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"] as ["ignore", "ignore", "ignore"],
-    env,
+  if (!fs.existsSync(script)) {
+    return { ok: false, error: `یافت نشد: ${script}` };
+  }
+
+  const env = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    OPENCV_FFMPEG_CAPTURE_OPTIONS:
+      "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
   };
+
+  const log = logPath();
+  let logFd: number | undefined;
+  try {
+    logFd = fs.openSync(log, "a");
+  } catch {
+    logFd = undefined;
+  }
+
+  const stdio: ["ignore", "pipe" | number, "pipe" | number] = logFd
+    ? ["ignore", logFd, logFd]
+    : ["ignore", "pipe", "pipe"];
 
   const candidates: [string, string[]][] =
     process.platform === "win32"
       ? [
           ["py", ["-3", script]],
           ["python", [script]],
-          ["python3", [script]],
         ]
       : [
           ["python3", [script]],
@@ -66,10 +86,28 @@ function spawnYoloOnce(): { ok: boolean; error?: string } {
   let lastErr = "";
   for (const [cmd, args] of candidates) {
     try {
-      const child = spawn(cmd, args, spawnOpts);
+      const child = spawn(cmd, args, {
+        cwd: root,
+        windowsHide: true,
+        detached: true,
+        stdio,
+        env,
+      });
       child.unref();
-      child.on("exit", () => {
+      child.on("error", (err) => {
+        lastErr = err.message;
         if (yoloProc === child) yoloProc = null;
+      });
+      child.on("exit", (code) => {
+        if (yoloProc === child) yoloProc = null;
+        try {
+          fs.appendFileSync(
+            log,
+            `\n[exit code=${code} at ${new Date().toISOString()}]\n`,
+          );
+        } catch {
+          /* */
+        }
       });
       yoloProc = child;
       return { ok: true };
@@ -78,7 +116,10 @@ function spawnYoloOnce(): { ok: boolean; error?: string } {
       yoloProc = null;
     }
   }
-  return { ok: false, error: lastErr || "Python پیدا نشد. Python 3 را نصب کنید." };
+  return {
+    ok: false,
+    error: lastErr || "Python پیدا نشد. Python 3 را نصب کنید.",
+  };
 }
 
 /** Fire-and-forget start — returns immediately so browser fetch never times out. */
@@ -100,20 +141,19 @@ export async function startYoloProcess(): Promise<{
 
   starting = (async () => {
     try {
-      const up = await waitUntilOnline(120000);
+      const up = await waitUntilOnline(180000);
       return up
         ? { ok: true }
         : {
             ok: false,
             error:
-              "راه‌اندازی YOLO طولانی شد. ultralytics را در همان Python بررسی کنید.",
+              "راه‌اندازی YOLO طولانی شد. لاگ yolo_server.log را در پوشه پروژه ببینید.",
           };
     } finally {
       starting = null;
     }
   })();
 
-  // don't await — client polls /api/yolo?kind=status
   return { ok: true, starting: true };
 }
 
@@ -139,7 +179,6 @@ export async function stopYoloProcess(): Promise<{ ok: boolean }> {
   }
   yoloProc = null;
 
-  // Windows: try kill by port if still up
   if (process.platform === "win32") {
     try {
       spawn(

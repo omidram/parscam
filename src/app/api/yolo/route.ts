@@ -25,14 +25,19 @@ const DEFAULTS = {
   enabled: true,
   model: "yolo26n.pt",
   open_vocab_model: "yoloe-26n-seg.pt",
-  confidence: 0.45,
-  infer_every_n_frames: 8,
+  use_open_vocab: false,
+  confidence: 0.35,
+  ov_confidence: 0.22,
+  infer_every_n_frames: 5,
+  ov_every_n_frames: 12,
+  imgsz: 320,
+  max_det: 20,
   cooldown_sec: 20,
   filters: {
     human: true,
-    fire: true,
-    gun: true,
-    knife: true,
+    fire: false,
+    gun: false,
+    knife: false,
     animal: true,
     vehicle: true,
   },
@@ -41,6 +46,7 @@ const DEFAULTS = {
   record_duration_sec: 60,
   auto_screenshot_on_detect: true,
   draw_boxes: true,
+  live_overlay: true,
 };
 
 function readFileSettings() {

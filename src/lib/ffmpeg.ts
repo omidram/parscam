@@ -3,17 +3,23 @@ import fs from "fs";
 import path from "path";
 import { recordingsRoot, projectRoot } from "@/lib/server-paths";
 
-const recordingProcs = new Map<number, ChildProcess>();
+type RecEntry = {
+  proc: ChildProcess;
+  outPath: string;
+  stopFile: string;
+};
+
+const recordingProcs = new Map<number, RecEntry>();
 
 export function isRecording(camId: number): boolean {
-  const p = recordingProcs.get(camId);
-  return Boolean(p && !p.killed && p.exitCode === null);
+  const e = recordingProcs.get(camId);
+  return Boolean(e && e.proc && !e.proc.killed && e.proc.exitCode === null);
 }
 
 export function recordingStatus(): Record<string, boolean> {
   const out: Record<string, boolean> = {};
-  for (const [id, proc] of recordingProcs) {
-    out[String(id)] = Boolean(proc && !proc.killed && proc.exitCode === null);
+  for (const [id] of recordingProcs) {
+    out[String(id)] = isRecording(id);
   }
   return out;
 }
@@ -26,14 +32,14 @@ export function normalizeRtspUrl(raw: string): string {
   const scheme = m[1];
   const userinfo = m[2];
   const hostport = m[3];
-  const path = m[4] || "";
+  const rest = m[4] || "";
   const colon = userinfo.indexOf(":");
   if (colon < 0) {
-    return `${scheme}://${encodeURIComponent(decodeURIComponentSafe(userinfo))}@${hostport}${path}`;
+    return `${scheme}://${encodeURIComponent(decodeURIComponentSafe(userinfo))}@${hostport}${rest}`;
   }
   const user = decodeURIComponentSafe(userinfo.slice(0, colon));
   const pass = decodeURIComponentSafe(userinfo.slice(colon + 1));
-  return `${scheme}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${hostport}${path}`;
+  return `${scheme}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${hostport}${rest}`;
 }
 
 function decodeURIComponentSafe(s: string): string {
@@ -64,8 +70,9 @@ export function buildRtspUrl(opts: {
 
 export function startFfmpegRecording(
   camId: number,
-  camName: string,
+  _camName: string,
   rtsp: string,
+  maxSeconds = 0,
 ): { ok: boolean; error?: string; path?: string } {
   if (isRecording(camId)) {
     return { ok: false, error: "قبلاً در حال ضبط است" };
@@ -83,37 +90,116 @@ export function startFfmpegRecording(
     .slice(0, 15);
   const filename = `cam${camId}_${stamp}.mp4`;
   const outPath = path.join(folder, filename);
-  const url = normalizeRtspUrl(rtsp);
+  const stopFile = `${outPath}.stop`;
+  const urlRaw = normalizeRtspUrl(rtsp);
+  // Prefer /sub so live /main stream is not dropped
+  const url =
+    urlRaw.includes("/main") && !urlRaw.includes("/sub")
+      ? urlRaw.replace("/main", "/sub")
+      : urlRaw;
 
   try {
-    const proc = spawn(
-      "ffmpeg",
-      [
-        "-y",
-        "-rtsp_transport",
-        "tcp",
-        "-i",
-        url,
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        outPath,
-      ],
-      {
-        stdio: ["ignore", "ignore", "pipe"],
-        windowsHide: true,
-      },
-    );
-    recordingProcs.set(camId, proc);
-    proc.on("exit", () => {
-      recordingProcs.delete(camId);
+    if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile);
+  } catch {
+    /* */
+  }
+
+  try {
+    const args = maxSeconds > 0 ? [url, outPath, String(maxSeconds)] : [url, outPath];
+    const root = /*turbopackIgnore: true*/ projectRoot();
+    const script = path.join(/*turbopackIgnore: true*/ root, "record_worker.py");
+    const env = {
+      ...process.env,
+      PYTHONUNBUFFERED: "1",
+      PARSCAM_RTSP_TRANSPORT: "tcp",
+      OPENCV_FFMPEG_CAPTURE_OPTIONS:
+        "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
+    };
+
+    const spawnRecorder = (rtspUrl: string) => {
+      const a =
+        maxSeconds > 0
+          ? [rtspUrl, outPath, String(maxSeconds)]
+          : [rtspUrl, outPath];
+      try {
+        return spawn(
+          process.platform === "win32" ? "py" : "python3",
+          process.platform === "win32" ? ["-3", script, ...a] : [script, ...a],
+          {
+            cwd: root,
+            windowsHide: true,
+            stdio: ["ignore", "ignore", "pipe"],
+            env,
+          },
+        );
+      } catch {
+        return spawn("python", [script, ...a], {
+          cwd: root,
+          windowsHide: true,
+          stdio: ["ignore", "ignore", "pipe"],
+          env,
+        });
+      }
+    };
+
+    let proc = spawnRecorder(url);
+    const logChunks: string[] = [];
+    const attachLog = (p: ChildProcess) => {
+      p.stderr?.on("data", (c: Buffer) => {
+        logChunks.push(c.toString());
+        if (logChunks.length > 40) logChunks.shift();
+      });
+    };
+    attachLog(proc);
+
+    // If /sub dies immediately, retry once on original /main
+    proc.once("exit", (code) => {
+      const current = recordingProcs.get(camId);
+      if (!current || current.proc !== proc) return;
+      const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
+      if (
+        code &&
+        code !== 0 &&
+        size < 1000 &&
+        url !== urlRaw &&
+        recordingProcs.has(camId)
+      ) {
+        try {
+          if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+        } catch {
+          /* */
+        }
+        proc = spawnRecorder(urlRaw);
+        attachLog(proc);
+        recordingProcs.set(camId, { proc, outPath, stopFile });
+        proc.on("exit", onFinalExit);
+        return;
+      }
+      onFinalExit(code);
     });
+
+    function onFinalExit(code: number | null) {
+      recordingProcs.delete(camId);
+      try {
+        if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile);
+      } catch {
+        /* */
+      }
+      try {
+        if (code && code !== 0) {
+          fs.writeFileSync(`${outPath}.log`, logChunks.join(""), "utf-8");
+        }
+      } catch {
+        /* */
+      }
+    }
+
+    recordingProcs.set(camId, { proc, outPath, stopFile });
     return { ok: true, path: outPath };
   } catch (e) {
     return {
       ok: false,
-      error: e instanceof Error ? e.message : "اجرای ffmpeg ناموفق",
+      error: e instanceof Error ? e.message : "اجرای ضبط ناموفق",
     };
   }
 }
@@ -121,14 +207,26 @@ export function startFfmpegRecording(
 export function stopFfmpegRecording(
   camId: number,
 ): { ok: boolean; error?: string } {
-  const proc = recordingProcs.get(camId);
-  if (!proc) return { ok: false, error: "در حال ضبط نیست" };
+  const entry = recordingProcs.get(camId);
+  if (!entry) return { ok: false, error: "در حال ضبط نیست" };
   try {
-    proc.kill("SIGINT");
-    setTimeout(() => {
-      if (!proc.killed) proc.kill("SIGKILL");
-    }, 2000);
-    recordingProcs.delete(camId);
+    // Graceful stop for OpenCV worker
+    fs.writeFileSync(entry.stopFile, "1", "utf-8");
+    const { proc } = entry;
+    const deadline = Date.now() + 8000;
+    const wait = () => {
+      if (proc.exitCode !== null || Date.now() > deadline) {
+        try {
+          if (!proc.killed && proc.exitCode === null) proc.kill();
+        } catch {
+          /* */
+        }
+        recordingProcs.delete(camId);
+        return;
+      }
+      setTimeout(wait, 200);
+    };
+    wait();
     return { ok: true };
   } catch (e) {
     return {
@@ -156,17 +254,26 @@ function pythonCandidates(): [string, string[]][] {
 }
 
 /** OpenCV MJPEG worker (same as Flask parscam) — most reliable for IP cams */
-export function spawnOpenCvMjpeg(rtsp: string): ChildProcess {
+export function spawnOpenCvMjpeg(
+  rtsp: string,
+  camId?: string | number,
+): ChildProcess {
   const url = normalizeRtspUrl(rtsp);
   const env = {
     ...process.env,
     PYTHONUNBUFFERED: "1",
     PARSCAM_RTSP_TRANSPORT: "tcp",
+    OPENCV_FFMPEG_CAPTURE_OPTIONS:
+      "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
   };
+  const extra =
+    camId !== undefined && camId !== null && String(camId) !== ""
+      ? [String(camId)]
+      : [];
   let lastErr: Error | null = null;
   for (const [cmd, baseArgs] of pythonCandidates()) {
     try {
-      const proc = spawn(cmd, [...baseArgs, url], {
+      const proc = spawn(cmd, [...baseArgs, url, ...extra], {
         cwd: /*turbopackIgnore: true*/ projectRoot(),
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
